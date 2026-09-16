@@ -18,8 +18,24 @@ import (
 )
 
 const (
-	AuthCookieName      = "multica_auth"
-	CSRFCookieName      = "multica_csrf"
+	AuthCookieName = "multica_auth"
+	// CSRFCookieName carries the token-bound CSRF value, and keeps carrying
+	// it: every server that has ever run this code understands this cookie,
+	// which is what makes rolling BACK past MUL-7436 safe. See
+	// SessionCSRFCookieName.
+	CSRFCookieName = "multica_csrf"
+	// SessionCSRFCookieName carries the session-bound CSRF value added by
+	// MUL-7436. It is the one the server prefers, because it survives a
+	// sliding renewal; the token-bound cookie above cannot, since renewal
+	// replaces the very token it is keyed to.
+	SessionCSRFCookieName = "multica_csrf_session"
+
+	// CSRFHeaderName / SessionCSRFHeaderName are where clients echo the two
+	// cookies back. A client may send either or both; the server accepts a
+	// request if EITHER verifies.
+	CSRFHeaderName        = "X-CSRF-Token"
+	SessionCSRFHeaderName = "X-CSRF-Session"
+
 	defaultAuthTokenTTL = 30 * 24 * time.Hour // 30 days
 )
 
@@ -127,57 +143,90 @@ func isSecureCookie() bool {
 	return strings.EqualFold(u.Scheme, "https")
 }
 
-// csrfSignature computes the signature half of a CSRF token.
+// Two CSRF bindings exist side by side, and the pair is deliberate.
 //
-// Two bindings exist, and which one applies is decided by whether the auth
-// token carries a `sid` claim:
+//   - Session-bound: HMAC-SHA256 keyed by the server's JWT secret over
+//     (sessionID, nonce). `sid` survives renewal, so re-signing the auth
+//     cookie leaves every CSRF token already issued for that session valid —
+//     which is what keeps sliding renewal from racing other tabs (MUL-7436).
+//     This is the HMAC-based Token Pattern OWASP recommends.
+//   - Token-bound: HMAC-SHA256 keyed by the auth token itself over the nonce.
+//     This is the original scheme, and it is still ISSUED, not merely still
+//     accepted. A server running the previous release can verify only this
+//     one, so dropping it would make a rollback strand every signed-in user
+//     able to read but unable to write: their session would authenticate on
+//     GET and 403 on every POST, with no client-side retry able to help. It
+//     is the only binding either version can agree on, so both are written.
 //
-//   - Session-bound (sessionID != ""): HMAC-SHA256 keyed by the server's JWT
-//     secret over (sessionID, nonce). `sid` survives renewal, so re-signing
-//     the auth cookie leaves every CSRF token already issued for that session
-//     valid — which is the whole reason sliding renewal does not race other
-//     tabs (MUL-7436). This is the HMAC-based Token Pattern OWASP recommends.
-//   - Legacy (sessionID == ""): HMAC-SHA256 keyed by the auth token itself
-//     over the nonce. This is the pre-MUL-7436 scheme, kept so cookies issued
-//     before this code shipped keep working until their session renews.
+// Both defend the same thing: an attacker who can write cookies on a sibling
+// subdomain cannot produce a CSRF value matching the auth cookie without
+// already holding the session it belongs to.
 //
-// Both bindings defend the same thing: an attacker who can write cookies on a
-// sibling subdomain cannot produce a CSRF token matching the auth cookie
-// without already holding the session it belongs to.
-func csrfSignature(sessionID, authToken string, nonce []byte) []byte {
-	if sessionID != "" {
-		mac := hmac.New(sha256.New, JWTSecret())
-		mac.Write([]byte(sessionID))
-		// Domain separator: without it a (sessionID, nonce) pair could be
-		// re-split, letting one session's token be read as another's.
-		mac.Write([]byte{0})
-		mac.Write(nonce)
-		return mac.Sum(nil)
-	}
+// The token-bound cookie becomes removable one release after this ships, when
+// no deployable version still needs it.
+func sessionCSRFSignature(sessionID string, nonce []byte) []byte {
+	mac := hmac.New(sha256.New, JWTSecret())
+	mac.Write([]byte(sessionID))
+	// Domain separator: without it a (sessionID, nonce) pair could be
+	// re-split, letting one session's token be read as another's.
+	mac.Write([]byte{0})
+	mac.Write(nonce)
+	return mac.Sum(nil)
+}
 
+func tokenCSRFSignature(authToken string, nonce []byte) []byte {
 	mac := hmac.New(sha256.New, []byte(authToken))
 	mac.Write(nonce)
 	return mac.Sum(nil)
 }
 
-// generateCSRFToken creates a CSRF token for an auth token.
-// Format: hex(nonce) + "." + hex(signature); see csrfSignature for the binding.
-func generateCSRFToken(authToken string) (string, error) {
+// csrfToken formats a CSRF value as hex(nonce) + "." + hex(signature).
+func csrfToken(sign func(nonce []byte) []byte) (string, error) {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-
-	sig := csrfSignature(SessionIDFromToken(authToken), authToken, nonce)
-	return hex.EncodeToString(nonce) + "." + hex.EncodeToString(sig), nil
+	return hex.EncodeToString(nonce) + "." + hex.EncodeToString(sign(nonce)), nil
 }
 
-// SetAuthCookies sets the HttpOnly auth cookie and the readable CSRF cookie on the response.
+// verifyCSRFToken checks a presented "nonce.signature" value against sign.
+func verifyCSRFToken(presented string, sign func(nonce []byte) []byte) bool {
+	parts := strings.SplitN(presented, ".", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	nonce, err := hex.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	sig, err := hex.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(sign(nonce), sig)
+}
+
+// SetAuthCookies sets the HttpOnly auth cookie and both readable CSRF cookies
+// on the response.
 func SetAuthCookies(w http.ResponseWriter, token string) error {
 	secure := isSecureCookie()
 	domain := cookieDomain()
 	ttl := AuthTokenTTL()
 	now := time.Now()
+
+	readable := func(name, value string) {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    value,
+			Path:     "/",
+			Domain:   domain,
+			MaxAge:   int(ttl.Seconds()),
+			Expires:  now.Add(ttl),
+			HttpOnly: false,
+			Secure:   secure,
+			SameSite: http.SameSiteStrictMode,
+		})
+	}
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     AuthCookieName,
@@ -191,54 +240,54 @@ func SetAuthCookies(w http.ResponseWriter, token string) error {
 		SameSite: http.SameSiteStrictMode,
 	})
 
-	csrfToken, err := generateCSRFToken(token)
+	tokenBound, err := csrfToken(func(nonce []byte) []byte {
+		return tokenCSRFSignature(token, nonce)
+	})
 	if err != nil {
 		return err
 	}
+	readable(CSRFCookieName, tokenBound)
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     CSRFCookieName,
-		Value:    csrfToken,
-		Path:     "/",
-		Domain:   domain,
-		MaxAge:   int(ttl.Seconds()),
-		Expires:  now.Add(ttl),
-		HttpOnly: false,
-		Secure:   secure,
-		SameSite: http.SameSiteStrictMode,
-	})
+	// Only a token carrying `sid` can have a session-bound value. A token
+	// minted before MUL-7436 has none until it renews, and until then the
+	// token-bound cookie above is the only one it can use.
+	if sid := SessionIDFromToken(token); sid != "" {
+		sessionBound, err := csrfToken(func(nonce []byte) []byte {
+			return sessionCSRFSignature(sid, nonce)
+		})
+		if err != nil {
+			return err
+		}
+		readable(SessionCSRFCookieName, sessionBound)
+	}
 
 	return nil
 }
 
-// ClearAuthCookies removes the auth and CSRF cookies.
+// ClearAuthCookies removes the auth cookie and both CSRF cookies.
 func ClearAuthCookies(w http.ResponseWriter) {
 	domain := cookieDomain()
 	secure := isSecureCookie()
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     AuthCookieName,
-		Value:    "",
-		Path:     "/",
-		Domain:   domain,
-		MaxAge:   -1,
-		Expires:  time.Unix(0, 0),
-		HttpOnly: true,
-		Secure:   secure,
-		SameSite: http.SameSiteStrictMode,
-	})
+	expire := func(name string, httpOnly bool) {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			Domain:   domain,
+			MaxAge:   -1,
+			Expires:  time.Unix(0, 0),
+			HttpOnly: httpOnly,
+			Secure:   secure,
+			SameSite: http.SameSiteStrictMode,
+		})
+	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     CSRFCookieName,
-		Value:    "",
-		Path:     "/",
-		Domain:   domain,
-		MaxAge:   -1,
-		Expires:  time.Unix(0, 0),
-		HttpOnly: false,
-		Secure:   secure,
-		SameSite: http.SameSiteStrictMode,
-	})
+	expire(AuthCookieName, true)
+	expire(CSRFCookieName, false)
+	// Logout must clear BOTH, or a stale session-bound value survives the
+	// logout and is presented alongside the next login's cookies.
+	expire(SessionCSRFCookieName, false)
 }
 
 // IsSafeMethod reports whether a method is read-only under RFC 9110, i.e. one
@@ -254,22 +303,28 @@ func IsSafeMethod(method string) bool {
 	return false
 }
 
-// ValidateCSRF checks the X-CSRF-Token header against the auth cookie.
-// The CSRF token is HMAC-signed (see csrfSignature), so the server verifies a
-// signature rather than simply comparing cookie == header.
+// ValidateCSRF checks the CSRF headers against the auth cookie. The values are
+// HMAC-signed, so the server verifies a signature rather than comparing
+// cookie == header.
 // Returns true if validation passes (including for safe methods that don't need CSRF).
 //
-// Both bindings are accepted. A session-bound token is the normal case; the
-// legacy auth-token binding is still honoured so a cookie pair issued before
-// MUL-7436 keeps working until that session is renewed.
+// Either binding is accepted, and the order matters only for clarity:
+//
+//   - The session-bound header is what a current client sends and what
+//     survives a sliding renewal.
+//   - The token-bound header is what a client that has not picked up the new
+//     cookie sends, what every pre-MUL-7436 cookie pair carries, and what a
+//     rolled-back server would be verifying.
+//
+// The `sid` here is read from the cookie WITHOUT enforcing expiry
+// (SessionIDFromToken). That is what keeps an expired session from failing
+// here: this function must not be the thing that answers a user whose session
+// just ended, because a 403 leaves the client retrying a write instead of
+// returning them to the login page. Authentication — and the 401 — happens
+// immediately after, in the auth middleware.
 func ValidateCSRF(r *http.Request) bool {
 	if IsSafeMethod(r.Method) {
 		return true
-	}
-
-	csrfHeader := r.Header.Get("X-CSRF-Token")
-	if csrfHeader == "" {
-		return false
 	}
 
 	authCookie, err := r.Cookie(AuthCookieName)
@@ -277,25 +332,21 @@ func ValidateCSRF(r *http.Request) bool {
 		return false
 	}
 
-	parts := strings.SplitN(csrfHeader, ".", 2)
-	if len(parts) != 2 {
-		return false
-	}
-
-	nonce, err := hex.DecodeString(parts[0])
-	if err != nil {
-		return false
-	}
-
-	presentedSig, err := hex.DecodeString(parts[1])
-	if err != nil {
-		return false
-	}
-
-	if sid := SessionIDFromToken(authCookie.Value); sid != "" {
-		if hmac.Equal(csrfSignature(sid, "", nonce), presentedSig) {
-			return true
+	if presented := r.Header.Get(SessionCSRFHeaderName); presented != "" {
+		if sid := SessionIDFromToken(authCookie.Value); sid != "" {
+			if verifyCSRFToken(presented, func(nonce []byte) []byte {
+				return sessionCSRFSignature(sid, nonce)
+			}) {
+				return true
+			}
 		}
 	}
-	return hmac.Equal(csrfSignature("", authCookie.Value, nonce), presentedSig)
+
+	if presented := r.Header.Get(CSRFHeaderName); presented != "" {
+		return verifyCSRFToken(presented, func(nonce []byte) []byte {
+			return tokenCSRFSignature(authCookie.Value, nonce)
+		})
+	}
+
+	return false
 }

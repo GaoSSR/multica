@@ -18,7 +18,8 @@
  * a session, and `onUnauthorized` in app/_layout.tsx already owns that.
  */
 import { api, ApiError } from "./api";
-import { getToken, setToken } from "./secure-storage";
+import { clearToken, getToken, setToken } from "./secure-storage";
+import { currentSessionEpoch, sessionEpochChanged } from "./session-epoch";
 
 /** Applies only between launch and the first response; every response carries
  *  the server's own cadence, derived from the deployment's token TTL. */
@@ -41,6 +42,14 @@ let inFlight: Promise<void> | null = null;
 export async function renewSessionNow(): Promise<void> {
   if (inFlight) return inFlight;
 
+  // Captured before anything awaits. Comparing tokens alone is not enough on
+  // mobile: logout's Keychain delete is async, so a read taken after logout
+  // began but before the delete landed still returns the old token, and this
+  // attempt would then write its replacement back over a session the user
+  // just ended. The epoch moves synchronously at the start of logout, a 401
+  // teardown and a new sign-in, so it is already stale by the time we check.
+  const epochAtStart = currentSessionEpoch();
+
   // Assigned before the first await, so two callers in the same tick cannot
   // both get past the guard above. Reading the Keychain is itself async, so
   // doing that first — outside the promise — would reopen the window this
@@ -51,7 +60,7 @@ export async function renewSessionNow(): Promise<void> {
       // against it, so an attempt that outlives its own session writes
       // nothing.
       const startedFrom = await getToken();
-      if (!startedFrom) return;
+      if (!startedFrom || sessionEpochChanged(epochAtStart)) return;
 
       lastAttemptAt = Date.now();
 
@@ -64,13 +73,24 @@ export async function renewSessionNow(): Promise<void> {
       }
       if (!result.renewed || !result.token) return;
 
-      // Late-result guard: a logout or an expiry during the round trip
-      // already cleared the Keychain, and writing our token back would
-      // resurrect a session the app has torn down.
+      // Late-result guard, epoch first: it is true the instant logout STARTS,
+      // while the token comparison below only becomes true once the Keychain
+      // delete has finished. Both are checked because they catch different
+      // things — the epoch catches a teardown in progress, the comparison
+      // catches a credential swapped by some path that did not bump it.
+      if (sessionEpochChanged(epochAtStart)) return;
       const current = await getToken();
-      if (current !== startedFrom) return;
+      if (current !== startedFrom || sessionEpochChanged(epochAtStart)) return;
 
       await setToken(result.token);
+      if (sessionEpochChanged(epochAtStart)) {
+        // A teardown landed while this write was in flight, so its own
+        // delete may have run before ours. Undo the write rather than
+        // leaving a live credential in the Keychain of a signed-out app —
+        // this is the one place that can tell the difference.
+        await clearToken();
+        return;
+      }
       api.setToken(result.token);
     } catch (err) {
       // A 401 has already been routed to the sign-out path by the client's

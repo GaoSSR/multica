@@ -242,3 +242,110 @@ func TestAuth_RenewedCookiesKeepTheirSecurityPosture(t *testing.T) {
 		t.Error("CSRF cookie must stay readable by the client")
 	}
 }
+
+// csrfHeadersFor runs the real cookie-setting path for mintedFor and copies
+// both CSRF cookies onto req as the headers a browser would echo back.
+//
+// mintedFor is a separate argument from the request's auth cookie on purpose:
+// a browser receives its CSRF cookies while the session is LIVE and keeps
+// presenting them afterwards, so a test about an expired session has to mint
+// from the live token and then present the expired one. Minting from the
+// expired token instead would be a scenario no browser can produce.
+func csrfHeadersFor(t *testing.T, req *http.Request, mintedFor string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	if err := auth.SetAuthCookies(rec, mintedFor); err != nil {
+		t.Fatalf("SetAuthCookies: %v", err)
+	}
+	for _, c := range rec.Result().Cookies() {
+		switch c.Name {
+		case auth.CSRFCookieName:
+			req.Header.Set(auth.CSRFHeaderName, c.Value)
+		case auth.SessionCSRFCookieName:
+			req.Header.Set(auth.SessionCSRFHeaderName, c.Value)
+		}
+	}
+}
+
+// A user whose session expired must be told their session expired. The CSRF
+// gate runs before the JWT is validated, so if it rejected an expired cookie
+// the user's first action after expiry — sending a comment, saving a setting —
+// answered 403 "CSRF validation failed" and the client just retried a failed
+// write. Only the 401 reaches the session-expiry path that returns them to the
+// login page, so CSRF has to let an expired-but-genuine cookie through and let
+// authentication be the thing that refuses it.
+func TestAuth_ExpiredSessionFailsAuthenticationNotCSRF(t *testing.T) {
+	// One session: cookies issued while it was live, presented after its JWT
+	// expired. `sid` is what ties the two together.
+	live := sessionToken(t, auth.AuthRenewThreshold()*2, "sid-expired")
+	expired := sessionToken(t, -time.Minute, "sid-expired")
+
+	req := cookieRequest(http.MethodPost, expired)
+	csrfHeadersFor(t, req, live)
+
+	rec, called := runAuth(t, req)
+	if called {
+		t.Fatal("an expired session must not authenticate")
+	}
+	if rec.Code == http.StatusForbidden {
+		t.Fatal("expired session was rejected by the CSRF gate; the client never learns the session ended")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+// The session-bound header ALONE must behave the same way. This is the case
+// that isolates the fix: the token-bound cookie is only still issued for
+// rollback safety and goes away a release from now, so a client presenting
+// just the session binding is the steady state, and it has no second binding
+// to fall back on when `sid` cannot be read.
+func TestAuth_ExpiredSessionWithOnlySessionCSRFStillGets401(t *testing.T) {
+	live := sessionToken(t, auth.AuthRenewThreshold()*2, "sid-expired-only")
+	expired := sessionToken(t, -time.Minute, "sid-expired-only")
+
+	req := cookieRequest(http.MethodPost, expired)
+	csrfHeadersFor(t, req, live)
+	req.Header.Del(auth.CSRFHeaderName)
+	if req.Header.Get(auth.SessionCSRFHeaderName) == "" {
+		t.Fatal("test needs a session-bound CSRF header")
+	}
+
+	rec, called := runAuth(t, req)
+	if called {
+		t.Fatal("an expired session must not authenticate")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 (403 means the CSRF gate refused it first)", rec.Code)
+	}
+}
+
+// The same for a session that expired while carrying only the legacy cookie
+// pair — those users exist too until their session renews.
+func TestAuth_ExpiredLegacySessionFailsAuthenticationNotCSRF(t *testing.T) {
+	expired := sessionToken(t, -time.Minute, "")
+
+	req := cookieRequest(http.MethodPost, expired)
+	csrfHeadersFor(t, req, expired)
+
+	rec, _ := runAuth(t, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 (got %d; 403 means CSRF refused it first)", rec.Code, rec.Code)
+	}
+}
+
+// A live session still has to pass the CSRF gate on a write — the fix above
+// must not have turned the gate off.
+func TestAuth_LiveSessionStillRequiresCSRF(t *testing.T) {
+	token := sessionToken(t, auth.AuthRenewThreshold()*2, "sid-live")
+
+	withHeaders := cookieRequest(http.MethodPost, token)
+	csrfHeadersFor(t, withHeaders, token)
+	if _, called := runAuth(t, withHeaders); !called {
+		t.Error("a live session with valid CSRF headers must be served")
+	}
+
+	if rec, called := runAuth(t, cookieRequest(http.MethodPost, token)); called || rec.Code != http.StatusForbidden {
+		t.Errorf("a write with no CSRF header must be 403, got %d (served=%v)", rec.Code, called)
+	}
+}

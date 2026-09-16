@@ -29,13 +29,23 @@ const TOKEN_STORAGE_KEY = "multica_token";
 
 /**
  * How long to wait before the first check may repeat, until the server says
- * otherwise. Only ever applies between app start and the first successful
- * response, since every response carries the real cadence.
+ * otherwise. It only ever applies between app start and the first answered
+ * check, because every response carries the real cadence — so the one case it
+ * governs is "the launch check failed and we have to try again". Five minutes
+ * is short enough to stay inside the renewal window of even a deliberately
+ * short AUTH_TOKEN_TTL, and long enough that an offline app is not retrying
+ * in a loop.
  */
-const FALLBACK_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const FALLBACK_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
-/** Guards against a nonsense `check_again_in_seconds` pinning us to a busy loop. */
-const MIN_CHECK_INTERVAL_MS = 60 * 1000;
+/**
+ * Anti-busy-loop floor, not a policy. The server owns the cadence and already
+ * guarantees its value fits inside the renewal window; this only stops a
+ * nonsense `check_again_in_seconds` from turning activity into a request per
+ * event. It matches the server's own floor, so it never overrides a value the
+ * server actually chose.
+ */
+const MIN_CHECK_INTERVAL_MS = 5 * 1000;
 
 export interface SessionRenewalOptions {
   api: ApiClient;

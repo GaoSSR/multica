@@ -15,6 +15,7 @@ import { maybeRenewSession } from "@/data/session-renewal";
 import { queryClient } from "@/data/query-client";
 import { useAuthStore } from "@/data/auth-store";
 import { useWorkspaceStore } from "@/data/workspace-store";
+import { SessionActivityBoundary } from "@/components/auth/session-activity-boundary";
 import { LightboxProvider, prewarmHighlighter } from "@/lib/markdown";
 import { NAV_THEME } from "@/lib/theme";
 import { useColorScheme } from "@/lib/use-color-scheme";
@@ -59,9 +60,11 @@ function AuthInitializer({ children }: { children: React.ReactNode }) {
     void initialize().then(() => maybeRenewSession());
   }, [initialize, qc]);
 
-  // Renewal follows use, and on a phone "use" means coming to the foreground.
-  // Deliberately not a timer: a backgrounded app must not keep a session of
-  // someone who stopped opening it alive.
+  // Foreground transitions are one of the two "someone is using this" signals;
+  // SessionActivityBoundary below supplies the other, so an app that stays
+  // foregrounded for longer than the check interval still renews. Deliberately
+  // not a timer: a backgrounded or untouched app must not keep the session of
+  // someone who stopped using it alive.
   useEffect(() => {
     const sub = AppState.addEventListener("change", (status: AppStateStatus) => {
       if (status === "active") maybeRenewSession();
@@ -81,6 +84,7 @@ export default function RootLayout() {
           <QueryClientProvider client={queryClient}>
             <ThemeProvider value={NAV_THEME[colorScheme]}>
               <AuthInitializer>
+                <SessionActivityBoundary>
                 <LightboxProvider>
                   <StatusBar style={isDarkColorScheme ? "light" : "dark"} />
                   <Stack screenOptions={{ headerShown: false }}>
@@ -90,6 +94,7 @@ export default function RootLayout() {
                   </Stack>
                   <PortalHost />
                 </LightboxProvider>
+                </SessionActivityBoundary>
               </AuthInitializer>
             </ThemeProvider>
           </QueryClientProvider>

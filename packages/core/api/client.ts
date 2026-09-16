@@ -721,12 +721,11 @@ export class ApiClient {
     return this.token;
   }
 
-  private readCsrfToken(): string | null {
+  private readCookie(name: string): string | null {
     if (typeof document === "undefined") return null;
-    const match = document.cookie
-      .split("; ")
-      .find((c) => c.startsWith("multica_csrf="));
-    return match ? match.split("=")[1] ?? null : null;
+    const prefix = `${name}=`;
+    const match = document.cookie.split("; ").find((c) => c.startsWith(prefix));
+    return match ? match.slice(prefix.length) || null : null;
   }
 
   private authHeaders(): Record<string, string> {
@@ -734,8 +733,15 @@ export class ApiClient {
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
     const slug = getCurrentSlug();
     if (slug) headers["X-Workspace-Slug"] = slug;
-    const csrf = this.readCsrfToken();
+    // Both CSRF cookies are echoed when present, and the server accepts
+    // either. The session-bound one survives a sliding renewal; the
+    // token-bound one is the only binding a server running the previous
+    // release can verify, so it keeps a rollback from leaving this client
+    // able to read and unable to write (MUL-7436).
+    const csrf = this.readCookie("multica_csrf");
     if (csrf) headers["X-CSRF-Token"] = csrf;
+    const sessionCsrf = this.readCookie("multica_csrf_session");
+    if (sessionCsrf) headers["X-CSRF-Session"] = sessionCsrf;
     const id = this.options.identity;
     if (id?.platform) headers["X-Client-Platform"] = id.platform;
     if (id?.version) headers["X-Client-Version"] = id.version;

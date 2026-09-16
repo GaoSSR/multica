@@ -2822,3 +2822,60 @@ describe("ApiClient sliding session renewal", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+
+// This file runs in the node environment, so `document` is stubbed rather
+// than relying on jsdom — readCookie only ever reads `document.cookie`, and a
+// stub keeps these tests next to the rest of the client's coverage.
+describe("ApiClient CSRF headers", () => {
+  function stubCookies(cookie: string) {
+    vi.stubGlobal("document", { cookie });
+  }
+
+  function jsonFetchMock() {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  function capturedHeaders(fetchMock: ReturnType<typeof vi.fn>) {
+    return (fetchMock.mock.calls[0]?.[1]?.headers ?? {}) as Record<string, string>;
+  }
+
+  it("echoes both cookies, so either binding can satisfy the server", async () => {
+    stubCookies("multica_csrf=token-bound-value; multica_csrf_session=session-bound-value");
+    const fetchMock = jsonFetchMock();
+
+    await new ApiClient("https://api.example.test").markOnboardingComplete();
+
+    const headers = capturedHeaders(fetchMock);
+    expect(headers["X-CSRF-Token"]).toBe("token-bound-value");
+    expect(headers["X-CSRF-Session"]).toBe("session-bound-value");
+  });
+
+  // A server running the previous release only understands the token-bound
+  // header, so it has to keep going out on its own after a rollback — and a
+  // session that predates the session-bound cookie has no other binding.
+  it("still sends the token-bound header when no session cookie exists", async () => {
+    stubCookies("multica_csrf=token-bound-value");
+    const fetchMock = jsonFetchMock();
+
+    await new ApiClient("https://api.example.test").markOnboardingComplete();
+
+    const headers = capturedHeaders(fetchMock);
+    expect(headers["X-CSRF-Token"]).toBe("token-bound-value");
+    expect(headers["X-CSRF-Session"]).toBeUndefined();
+  });
+
+  it("sends neither header when there is no cookie to echo", async () => {
+    stubCookies("");
+    const fetchMock = jsonFetchMock();
+
+    await new ApiClient("https://api.example.test").markOnboardingComplete();
+
+    const headers = capturedHeaders(fetchMock);
+    expect(headers["X-CSRF-Token"]).toBeUndefined();
+    expect(headers["X-CSRF-Session"]).toBeUndefined();
+  });
+});

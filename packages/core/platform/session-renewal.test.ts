@@ -138,6 +138,26 @@ describe("createSessionRenewal", () => {
     expect(h.api.refreshSession).toHaveBeenCalledTimes(1);
   });
 
+  // The server computes a cadence that fits inside the renewal window, which
+  // for a short AUTH_TOKEN_TTL can be seconds. A client-side floor above that
+  // value would silently override the server and let an actively used session
+  // expire, so the floor has to stay below anything the server can send.
+  it("honours a short server-supplied cadence instead of flooring it", async () => {
+    const h = makeHarness();
+    h.api.refreshSession.mockResolvedValue(notYetResponse(10));
+
+    const renewal = renewalFor(h);
+    await renewal.renewNow();
+
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 11_000);
+    renewal.maybeRenew();
+    await vi.waitFor(() =>
+      expect(h.api.refreshSession).toHaveBeenCalledTimes(2),
+    );
+    vi.mocked(Date.now).mockRestore();
+  });
+
   it("checks again once the interval has passed", async () => {
     const h = makeHarness();
     h.api.refreshSession.mockResolvedValue(notYetResponse(60));

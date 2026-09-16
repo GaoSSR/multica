@@ -135,12 +135,40 @@ func TestSetAuthCookies_HTTPSProduction(t *testing.T) {
 
 // csrfHeaderFor builds the request a browser would send: the auth cookie the
 // server set, plus the CSRF cookie's value echoed in the header.
-func csrfRequest(t *testing.T, authToken, csrfToken string) *http.Request {
+// csrfRequest presents authToken as the auth cookie and csrfValue as the
+// SESSION-bound header, which is what a current client sends.
+func csrfRequest(t *testing.T, authToken, csrfValue string) *http.Request {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/api/issues", nil)
 	req.AddCookie(&http.Cookie{Name: AuthCookieName, Value: authToken})
-	req.Header.Set("X-CSRF-Token", csrfToken)
+	req.Header.Set(SessionCSRFHeaderName, csrfValue)
 	return req
+}
+
+// legacyCSRFRequest presents the token-bound header instead — what a client
+// that has not picked up the new cookie sends, and what a rolled-back server
+// would be verifying.
+func legacyCSRFRequest(t *testing.T, authToken, csrfValue string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/issues", nil)
+	req.AddCookie(&http.Cookie{Name: AuthCookieName, Value: authToken})
+	req.Header.Set(CSRFHeaderName, csrfValue)
+	return req
+}
+
+// cookieValues runs the real cookie-setting path and returns the readable
+// cookies by name.
+func cookieValues(t *testing.T, authToken string) map[string]string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	if err := SetAuthCookies(rec, authToken); err != nil {
+		t.Fatalf("SetAuthCookies: %v", err)
+	}
+	out := map[string]string{}
+	for _, c := range rec.Result().Cookies() {
+		out[c.Name] = c.Value
+	}
+	return out
 }
 
 // setAuthCookiesFor runs the real cookie-setting path and returns the CSRF
@@ -148,16 +176,11 @@ func csrfRequest(t *testing.T, authToken, csrfToken string) *http.Request {
 // paths use rather than reimplementing the token format.
 func setAuthCookiesFor(t *testing.T, authToken string) string {
 	t.Helper()
-	rec := httptest.NewRecorder()
-	if err := SetAuthCookies(rec, authToken); err != nil {
-		t.Fatalf("SetAuthCookies: %v", err)
+	values := cookieValues(t, authToken)
+	if v := values[SessionCSRFCookieName]; v != "" {
+		return v
 	}
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == CSRFCookieName {
-			return c.Value
-		}
-	}
-	t.Fatal("no CSRF cookie was set")
+	t.Fatal("no session-bound CSRF cookie was set")
 	return ""
 }
 
@@ -214,19 +237,112 @@ func TestValidateCSRF_RejectsTokenFromAnotherSession(t *testing.T) {
 // Everyone signed in when this ships holds a cookie pair minted under the old
 // binding. Those must keep working until that session renews, or the deploy
 // logs the whole userbase out of every state-changing action.
-func TestValidateCSRF_AcceptsLegacyTokenBinding(t *testing.T) {
+func TestValidateCSRF_AcceptsTokenBinding(t *testing.T) {
 	legacy := signSession(t, sessionClaims(t, time.Now().Add(20*24*time.Hour), ""))
 
-	legacyCSRF := setAuthCookiesFor(t, legacy)
-	if !ValidateCSRF(csrfRequest(t, legacy, legacyCSRF)) {
+	values := cookieValues(t, legacy)
+	if values[SessionCSRFCookieName] != "" {
+		t.Error("a token without `sid` has no session to bind to; no session cookie should be set")
+	}
+	if !ValidateCSRF(legacyCSRFRequest(t, legacy, values[CSRFCookieName])) {
 		t.Error("a pre-MUL-7436 cookie pair must still validate")
 	}
 
-	// And the legacy binding stays bound: it is keyed by the token itself, so
+	// And the token binding stays bound: it is keyed by the token itself, so
 	// it must not validate against a different one.
 	other := signSession(t, sessionClaims(t, time.Now().Add(time.Hour), ""))
-	if ValidateCSRF(csrfRequest(t, other, legacyCSRF)) {
-		t.Error("a legacy CSRF token must not validate against a different auth token")
+	if ValidateCSRF(legacyCSRFRequest(t, other, values[CSRFCookieName])) {
+		t.Error("a token-bound CSRF value must not validate against a different auth token")
+	}
+}
+
+// Rolling BACK past MUL-7436 must not strand signed-in users able to read and
+// unable to write. A previous release verifies only the token binding, so
+// every cookie set here has to include one — that is the sole reason it is
+// still issued alongside the session binding.
+func TestSetAuthCookies_KeepsTokenBindingForRollback(t *testing.T) {
+	sid, _ := NewSessionID()
+	token := signSession(t, sessionClaims(t, time.Now().Add(20*24*time.Hour), sid))
+
+	values := cookieValues(t, token)
+	if values[CSRFCookieName] == "" {
+		t.Fatal("the token-bound cookie must still be issued; without it a rollback cannot verify any write")
+	}
+	if values[SessionCSRFCookieName] == "" {
+		t.Fatal("the session-bound cookie must be issued")
+	}
+	if values[CSRFCookieName] == values[SessionCSRFCookieName] {
+		t.Error("the two cookies must carry different bindings")
+	}
+
+	// Exactly what a rolled-back server does: verify the token-bound value
+	// against the auth cookie, knowing nothing about `sid`.
+	if !verifyCSRFToken(values[CSRFCookieName], func(nonce []byte) []byte {
+		return tokenCSRFSignature(token, nonce)
+	}) {
+		t.Error("the token-bound cookie must verify under the pre-MUL-7436 scheme")
+	}
+
+	// And a current server accepts it too, so a client that only ever sends
+	// the token-bound header keeps working.
+	if !ValidateCSRF(legacyCSRFRequest(t, token, values[CSRFCookieName])) {
+		t.Error("a current server must still accept the token-bound header")
+	}
+}
+
+// After a renewal the token-bound cookie is re-minted for the NEW token, so a
+// rollback taken at any point still finds a usable pair — that is what makes
+// the rollback path complete rather than only true at login.
+func TestSetAuthCookies_TokenBindingTracksRenewal(t *testing.T) {
+	sid, _ := NewSessionID()
+	claims := sessionClaims(t, time.Now().Add(20*24*time.Hour), sid)
+	renewed, _, err := RenewSessionToken(claims)
+	if err != nil {
+		t.Fatalf("RenewSessionToken: %v", err)
+	}
+
+	values := cookieValues(t, renewed)
+	if !verifyCSRFToken(values[CSRFCookieName], func(nonce []byte) []byte {
+		return tokenCSRFSignature(renewed, nonce)
+	}) {
+		t.Error("the renewed token-bound cookie must be keyed to the renewed token")
+	}
+}
+
+// A request carrying both headers is accepted on the strength of either, so a
+// client mid-upgrade — new cookie, stale token-bound value or vice versa — is
+// never wedged.
+func TestValidateCSRF_AcceptsEitherHeaderWhenBothAreSent(t *testing.T) {
+	sid, _ := NewSessionID()
+	original := signSession(t, sessionClaims(t, time.Now().Add(20*24*time.Hour), sid))
+	values := cookieValues(t, original)
+
+	renewedClaims := sessionClaims(t, time.Now().Add(20*24*time.Hour), sid)
+	renewed, _, err := RenewSessionToken(renewedClaims)
+	if err != nil {
+		t.Fatalf("RenewSessionToken: %v", err)
+	}
+
+	// Post-renewal the token-bound value is stale (it was keyed to the old
+	// token) but the session-bound one is not.
+	req := csrfRequest(t, renewed, values[SessionCSRFCookieName])
+	req.Header.Set(CSRFHeaderName, values[CSRFCookieName])
+	if !ValidateCSRF(req) {
+		t.Error("a stale token-bound header must not veto a valid session-bound one")
+	}
+}
+
+// Expiry is not this gate's business. SessionIDFromToken reads `sid` without
+// enforcing it, so an expired-but-genuine cookie still validates here and the
+// auth middleware answers with the 401 that ends the session.
+func TestValidateCSRF_IgnoresExpirySoAuthCanAnswer(t *testing.T) {
+	sid, _ := NewSessionID()
+	live := signSession(t, sessionClaims(t, time.Now().Add(time.Hour), sid))
+	expired := signSession(t, sessionClaims(t, time.Now().Add(-time.Hour), sid))
+
+	csrf := setAuthCookiesFor(t, live)
+	if !ValidateCSRF(csrfRequest(t, expired, csrf)) {
+		t.Error("an expired session must fail authentication, not CSRF — a 403 here never reaches the session-expiry path")
 	}
 }
 

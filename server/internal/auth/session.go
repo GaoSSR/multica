@@ -49,7 +49,18 @@ const (
 	// renewal cadence (DefaultTokenRenewalInterval).
 	sessionRenewCheckDivisor = 10
 
-	minSessionRenewCheckInterval = 5 * time.Minute
+	// minSessionRenewCheckInterval is a pure anti-busy-loop floor, not a
+	// policy: it only exists so a degenerate AUTH_TOKEN_TTL cannot turn
+	// every client into a request generator. It is small enough that it
+	// never decides the cadence for any TTL an operator would actually
+	// configure — the window cap below outranks it, because an interval
+	// that cannot fit inside the renewal window is not a cadence, it is a
+	// guaranteed logout.
+	minSessionRenewCheckInterval = 5 * time.Second
+
+	// maxSessionRenewCheckInterval bounds the other end: a client that has
+	// not asked in a week is far enough from its own state that checking is
+	// cheap insurance, whatever the TTL says.
 	maxSessionRenewCheckInterval = 7 * 24 * time.Hour
 )
 
@@ -71,13 +82,23 @@ func AuthRenewThreshold() time.Duration { return AuthTokenTTL() / 2 }
 // configured TTL so a deployment that shortens AUTH_TOKEN_TTL automatically
 // gets proportionally more frequent checks — clients must never hardcode a
 // cadence tuned for the 30-day default.
+//
+// The cadence has one hard requirement: it must fit inside the renewal
+// window, or a client that follows it can miss the window entirely and be
+// logged out while actively using the app. Capping at half the threshold
+// guarantees at least two attempts inside it, so a single failed check is
+// never fatal. That cap is applied last, after both clamps, because it is
+// the correctness constraint and they are only guard rails.
 func SessionRenewCheckInterval() time.Duration {
 	interval := AuthTokenTTL() / sessionRenewCheckDivisor
 	if interval < minSessionRenewCheckInterval {
-		return minSessionRenewCheckInterval
+		interval = minSessionRenewCheckInterval
 	}
 	if interval > maxSessionRenewCheckInterval {
-		return maxSessionRenewCheckInterval
+		interval = maxSessionRenewCheckInterval
+	}
+	if cap := AuthRenewThreshold() / 2; interval > cap {
+		interval = cap
 	}
 	return interval
 }
@@ -120,17 +141,13 @@ func SessionExpiry(claims jwt.MapClaims) time.Time {
 	return exp.Time
 }
 
-// ParseSessionToken verifies a raw token string as one of our UI session
-// JWTs and returns its claims. Anything that is not a validly signed,
-// unexpired HS256 JWT — including every opaque token prefix — comes back as
-// ErrNotSessionToken.
-func ParseSessionToken(tokenString string) (jwt.MapClaims, error) {
+func parseSignedToken(tokenString string, opts ...jwt.ParserOption) (jwt.MapClaims, error) {
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, jwt.ErrSignatureInvalid
 		}
 		return JWTSecret(), nil
-	})
+	}, opts...)
 	if err != nil || !token.Valid {
 		return nil, ErrNotSessionToken
 	}
@@ -141,12 +158,34 @@ func ParseSessionToken(tokenString string) (jwt.MapClaims, error) {
 	return claims, nil
 }
 
+// ParseSessionToken verifies a raw token string as one of our UI session
+// JWTs and returns its claims. Anything that is not a validly signed,
+// unexpired HS256 JWT — including every opaque token prefix — comes back as
+// ErrNotSessionToken.
+//
+// This is the AUTHENTICATION parser: use it wherever the answer decides
+// whether the caller is logged in or whether a session may be extended.
+func ParseSessionToken(tokenString string) (jwt.MapClaims, error) {
+	return parseSignedToken(tokenString)
+}
+
 // SessionIDFromToken returns the `sid` claim of a token we signed, or "" for
 // anything else — an opaque PAT, a forged string, or one of the pre-MUL-7436
 // JWTs minted before the claim existed. "" is the signal to fall back to the
 // legacy CSRF binding; see ValidateCSRF.
+//
+// Expiry is deliberately NOT enforced here, and that distinction is
+// load-bearing. This function answers "which session does this cookie
+// belong to", not "may this cookie authenticate" — the signature alone
+// settles the first question, and the auth middleware settles the second a
+// few lines later. Enforcing expiry here instead meant an EXPIRED cookie
+// lost its `sid`, so its perfectly valid CSRF token failed to verify and the
+// user's first action after expiry was answered with 403 "CSRF validation
+// failed" rather than the 401 that ends the session and sends them to the
+// login page. A rejected CSRF token must never be how a user learns their
+// session ended.
 func SessionIDFromToken(tokenString string) string {
-	claims, err := ParseSessionToken(tokenString)
+	claims, err := parseSignedToken(tokenString, jwt.WithoutClaimsValidation())
 	if err != nil {
 		return ""
 	}

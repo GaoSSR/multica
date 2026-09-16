@@ -99,18 +99,47 @@ func TestSessionRenewCheckInterval_TracksTTL(t *testing.T) {
 	cases := []struct {
 		ttl  string
 		want time.Duration
+		why  string
 	}{
-		{"720h", 72 * time.Hour},       // 30d default → 3d, same as the daemon's PAT cadence
-		{"24h", 144 * time.Minute},     // short TTL → proportionally short cadence
-		{"30m", 5 * time.Minute},       // clamped at the floor
-		{"87600h", 7 * 24 * time.Hour}, // 10y → clamped at the ceiling
+		{"720h", 72 * time.Hour, "30d default → TTL/10 = 3d, same as the daemon's PAT cadence"},
+		{"24h", 144 * time.Minute, "short TTL → proportionally short cadence"},
+		{"30m", 3 * time.Minute, "TTL/10, comfortably inside the 15m window"},
+		{"10m", time.Minute, "the TTL the PR's manual test plan uses"},
+		{"1m", 6 * time.Second, "TTL/10 is still above the anti-busy-loop floor"},
+		{"20s", 5 * time.Second, "TTL/10 would be 2s; the floor lifts it, and it still fits the 10s window"},
+		{"10s", 2500 * time.Millisecond, "floor would be 5s, but half the 5s window wins — correctness outranks politeness"},
+		{"87600h", 7 * 24 * time.Hour, "10y → clamped at the ceiling"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.ttl, func(t *testing.T) {
 			t.Setenv("AUTH_TOKEN_TTL", tc.ttl)
 			resetAuthTokenTTLForTest(t)
 			if got := SessionRenewCheckInterval(); got != tc.want {
-				t.Errorf("SessionRenewCheckInterval() = %s, want %s (TTL=%s)", got, tc.want, tc.ttl)
+				t.Errorf("SessionRenewCheckInterval() = %s, want %s (TTL=%s: %s)", got, tc.want, tc.ttl, tc.why)
+			}
+		})
+	}
+}
+
+// The cadence has exactly one property that must hold for every configurable
+// TTL: a client that follows it gets at least two chances inside the renewal
+// window. Without that a short TTL produces an interval LONGER than the window
+// — and a client doing everything right is logged out while actively using the
+// app. The previous flat 5-minute floor did that for any TTL under 10 minutes.
+func TestSessionRenewCheckInterval_AlwaysFitsInsideTheRenewalWindow(t *testing.T) {
+	for _, ttl := range []string{"10s", "20s", "1m", "5m", "10m", "30m", "1h", "24h", "720h", "8760h", "87600h"} {
+		t.Run(ttl, func(t *testing.T) {
+			t.Setenv("AUTH_TOKEN_TTL", ttl)
+			resetAuthTokenTTLForTest(t)
+
+			interval := SessionRenewCheckInterval()
+			threshold := AuthRenewThreshold()
+			if interval > threshold/2 {
+				t.Errorf("interval %s leaves fewer than two attempts inside a %s window (TTL=%s)",
+					interval, threshold, ttl)
+			}
+			if interval <= 0 {
+				t.Errorf("interval %s is not a usable cadence", interval)
 			}
 		})
 	}
@@ -301,5 +330,39 @@ func TestSlidingSession_IdleSessionStillExpires(t *testing.T) {
 	// ...and the session is gone one TTL after it was issued.
 	if ShouldRenewSession(lastUsed.Add(ttl+time.Second), expiresAt) {
 		t.Error("an expired idle session must not be renewable")
+	}
+}
+
+// SessionIDFromToken must answer "which session is this" for a token whose
+// signature is ours, even once it has expired. It feeds CSRF validation, which
+// runs before authentication — returning "" for an expired token made a valid
+// CSRF value fail and turned session expiry into a 403 on the user's next
+// write instead of the 401 that logs them out.
+func TestSessionIDFromToken_ReadsExpiredTokens(t *testing.T) {
+	expired := signSession(t, sessionClaims(t, time.Now().Add(-24*time.Hour), "sid-expired"))
+	if got := SessionIDFromToken(expired); got != "sid-expired" {
+		t.Errorf("SessionIDFromToken(expired) = %q, want sid-expired", got)
+	}
+
+	// Still only OUR tokens: a forged one has no session to name.
+	forged, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": "user-1", "sid": "forged", "exp": float64(time.Now().Add(-time.Hour).Unix()),
+	}).SignedString([]byte("some-other-secret"))
+	if got := SessionIDFromToken(forged); got != "" {
+		t.Errorf("SessionIDFromToken(forged) = %q, want empty", got)
+	}
+}
+
+// The authentication parser keeps enforcing expiry, which is what stops the
+// relaxed read above from leaking into anything that decides access. These two
+// answers must stay different for the same token.
+func TestParseSessionToken_StillEnforcesExpiryAfterTheSplit(t *testing.T) {
+	expired := signSession(t, sessionClaims(t, time.Now().Add(-time.Minute), "sid-x"))
+
+	if _, err := ParseSessionToken(expired); err != ErrNotSessionToken {
+		t.Errorf("ParseSessionToken(expired) err = %v, want ErrNotSessionToken", err)
+	}
+	if SessionIDFromToken(expired) == "" {
+		t.Error("SessionIDFromToken must still read the same token")
 	}
 }

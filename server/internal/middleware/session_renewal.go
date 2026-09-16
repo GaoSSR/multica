@@ -43,7 +43,7 @@ func SessionRenewed(r *http.Request) bool {
 // Every failure below is non-fatal and silent to the caller: the session that
 // authenticated this request is still valid for at least another TTL/2, so a
 // failed renewal costs one more chance at it, not the session.
-func renewCookieSession(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims, fromCookie bool) *http.Request {
+func renewCookieSession(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims, fromCookie bool, cfSigner *auth.CloudFrontSigner) *http.Request {
 	if !fromCookie || !auth.IsSafeMethod(r.Method) {
 		return r
 	}
@@ -51,7 +51,7 @@ func renewCookieSession(w http.ResponseWriter, r *http.Request, claims jwt.MapCl
 		return r
 	}
 
-	token, _, err := auth.RenewSessionToken(claims)
+	token, expiresAt, err := auth.RenewSessionToken(claims)
 	if err != nil {
 		slog.Debug("auth: session renewal skipped", "path", r.URL.Path, "error", err)
 		return r
@@ -62,6 +62,19 @@ func renewCookieSession(w http.ResponseWriter, r *http.Request, claims jwt.MapCl
 	if err := auth.SetAuthCookies(w, token); err != nil {
 		slog.Warn("auth: failed to set renewed session cookies", "path", r.URL.Path, "error", err)
 		return r
+	}
+
+	// The CDN cookies are signed for the lifetime of the session that created
+	// them, so a renewal that did not re-sign would leave the policy pinned to
+	// the original login — and a session that now never expires would 403
+	// every image and attachment once that policy lapsed. Re-signing here,
+	// next to the renewal itself, is what keeps the two in lockstep on EVERY
+	// route group that can renew, not only the ones that also mount
+	// RefreshCloudFrontCookies.
+	if cfSigner != nil {
+		for _, cookie := range cfSigner.SignedCookies(expiresAt) {
+			http.SetCookie(w, cookie)
+		}
 	}
 
 	return r.WithContext(context.WithValue(r.Context(), sessionRenewedCtxKey{}, true))
