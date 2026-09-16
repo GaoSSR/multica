@@ -101,3 +101,67 @@ func TestRefreshCloudFrontCookies_SkipsWhenCookiePresent(t *testing.T) {
 		t.Error("should not refresh cookies when CloudFront-Policy is already present")
 	}
 }
+
+// The CDN cookies are signed for the same lifetime as the session that
+// created them. Once sessions slide, a renewal that did not re-sign would
+// leave the CDN policy pinned to the original login — and a session that now
+// never expires would 403 every asset for as long as the stale cookie lived.
+func TestRefreshCloudFrontCookies_ReSignsWhenSessionRenewed(t *testing.T) {
+	signer := testSigner(t)
+
+	var served bool
+	handler := Auth(nil, nil, nil)(
+		RefreshCloudFrontCookies(signer)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			served = true
+			w.WriteHeader(http.StatusOK)
+		})),
+	)
+
+	req := cookieRequest(http.MethodGet, sessionToken(t, auth.AuthRenewThreshold()/2, "sid-cdn"))
+	// A live CloudFront policy is already present: without the renewal signal
+	// the middleware would leave it alone.
+	req.AddCookie(&http.Cookie{Name: "CloudFront-Policy", Value: "existing-policy"})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !served {
+		t.Fatal("request must still be served")
+	}
+	var policy *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "CloudFront-Policy" {
+			policy = c
+		}
+	}
+	if policy == nil {
+		t.Fatal("a renewed session must re-sign the CloudFront cookies")
+	}
+	if policy.Value == "existing-policy" {
+		t.Error("CloudFront policy was not re-signed")
+	}
+	if !policy.Expires.After(time.Now().Add(auth.AuthRenewThreshold())) {
+		t.Errorf("re-signed CloudFront cookie expires at %s, which is not past the renewal threshold", policy.Expires)
+	}
+}
+
+// Without a renewal, an existing policy cookie is still left alone — this is
+// the pre-existing behaviour and the reason responses aren't full of
+// Set-Cookie headers.
+func TestRefreshCloudFrontCookies_LeavesLivePolicyAloneWithoutRenewal(t *testing.T) {
+	signer := testSigner(t)
+
+	handler := RefreshCloudFrontCookies(signer)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "CloudFront-Policy", Value: "existing-policy"})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if len(rec.Result().Cookies()) != 0 {
+		t.Error("an unrenewed request with a live policy must not re-sign")
+	}
+}
