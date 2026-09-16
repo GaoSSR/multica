@@ -2736,3 +2736,89 @@ describe("ApiClient session expiry", () => {
     expect(storage.getItem("multica_token")).toBeNull();
   });
 });
+
+describe("ApiClient sliding session renewal", () => {
+  function jsonResponse(body: unknown, status = 200) {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  it("validates the refresh response and falls back to 'not renewed'", async () => {
+    // A malformed body must never be read as a renewal: acting on it would
+    // hand `undefined` to the code that persists the token.
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ renewed: "yes" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await new ApiClient("https://api.example.test").refreshSession();
+
+    expect(result.renewed).toBe(false);
+    expect(result.token).toBeUndefined();
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.example.test/api/auth/refresh");
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("POST");
+  });
+
+  it("returns the renewed token for a bearer client", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse({
+          token: "token-v2",
+          expires_at: "2026-10-16T00:00:00Z",
+          renewed: true,
+          check_again_in_seconds: 259200,
+        }),
+      ),
+    );
+
+    const result = await new ApiClient("https://api.example.test").refreshSession();
+
+    expect(result).toMatchObject({
+      token: "token-v2",
+      renewed: true,
+      check_again_in_seconds: 259200,
+    });
+  });
+
+  // The one case where a session renewal can invalidate a CSRF token another
+  // tab is already holding: the first renewal of a session that predates the
+  // session-bound binding. The cookie has already been replaced by then, so
+  // re-reading it and sending again is enough (MUL-7436).
+  it("retries once when a CSRF token turns out to be stale", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ error: "CSRF validation failed" }, 403))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(client.markOnboardingComplete()).resolves.toBeDefined();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a 403 that is a real authorization failure", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ error: "forbidden" }, 403));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(client.markOnboardingComplete()).rejects.toBeInstanceOf(ApiError);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up after one retry rather than looping", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ error: "CSRF validation failed" }, 403));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(client.markOnboardingComplete()).rejects.toBeInstanceOf(ApiError);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});

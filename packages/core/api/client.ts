@@ -297,6 +297,9 @@ import {
   EMPTY_WEBHOOK_DELIVERY,
   AppConfigSchema,
   type AppConfigResponse,
+  type RefreshSessionResponse,
+  RefreshSessionResponseSchema,
+  EMPTY_REFRESH_SESSION_RESPONSE,
   GroupedIssuesResponseSchema,
   IssueTableFacetsResponseSchema,
   IssueTableGroupsResponseSchema,
@@ -669,6 +672,26 @@ function dingTalkGroupSearch(params: ListDingTalkGroupsParams): string {
   return encoded ? `?${encoded}` : "";
 }
 
+// The server's exact wording for a rejected CSRF token
+// (server/internal/middleware/auth.go). Matched rather than inferred from the
+// status, because 403 also covers real authorization failures that must not
+// be retried.
+const CSRF_REJECTED_ERROR = "CSRF validation failed";
+
+/**
+ * Whether a request body can be sent a second time. Strings and multipart
+ * forms can; a stream cannot, and silently replaying a half-consumed one
+ * would send a truncated request.
+ */
+function isReplayableBody(body: BodyInit | null | undefined): boolean {
+  if (body === undefined || body === null) return true;
+  if (typeof body === "string") return true;
+  if (typeof FormData !== "undefined" && body instanceof FormData) return true;
+  if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams)
+    return true;
+  return false;
+}
+
 export class ApiClient {
   private baseUrl: string;
   private token: string | null = null;
@@ -687,6 +710,15 @@ export class ApiClient {
 
   setToken(token: string | null) {
     this.token = token;
+  }
+
+  /**
+   * The bearer token this client is currently using, or null in cookie mode.
+   * Session renewal reads it to confirm the session it started from is still
+   * the live one before writing a renewed token back.
+   */
+  getToken(): string | null {
+    return this.token;
   }
 
   private readCsrfToken(): string | null {
@@ -756,20 +788,41 @@ export class ApiClient {
     const start = Date.now();
     const method = init?.method ?? "GET";
 
-    const headers: Record<string, string> = {
+    // Rebuilt per attempt rather than captured once: authHeaders() reads the
+    // CSRF cookie at call time, and the retry below exists precisely because
+    // that cookie may have just been replaced.
+    const buildHeaders = (): Record<string, string> => ({
       "X-Request-ID": rid,
       ...this.authHeaders(),
       ...(init?.extraHeaders ?? {}),
       ...((init?.headers as Record<string, string>) ?? {}),
-    };
+    });
 
     this.logger.info(`→ ${method} ${path}`, { rid });
 
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      ...init,
-      headers,
-      credentials: "include",
-    });
+    const send = () =>
+      fetch(`${this.baseUrl}${path}`, {
+        ...init,
+        headers: buildHeaders(),
+        credentials: "include",
+      });
+
+    let res = await send();
+
+    // A CSRF token is bound to the session, so a renewed session normally
+    // leaves the one this request carried perfectly valid (MUL-7436). One
+    // case escapes that: the first renewal of a session predating the
+    // session-bound binding rotates a cookie the old token was keyed to, and
+    // a request another tab had already built goes out with a CSRF token for
+    // the previous cookie. That is a stale token, not an attack — re-reading
+    // the cookie and sending again resolves it, once.
+    if (res.status === 403 && isReplayableBody(init?.body)) {
+      const { message } = await this.parseErrorBody(res.clone(), "");
+      if (message === CSRF_REJECTED_ERROR) {
+        this.logger.info(`↻ ${method} ${path} (stale CSRF token, retrying once)`, { rid });
+        res = await send();
+      }
+    }
 
     if (!res.ok) {
       if (res.status === 401) this.handleUnauthorized();
@@ -823,6 +876,27 @@ export class ApiClient {
 
   async issueCliToken(): Promise<{ token: string }> {
     return this.fetch("/api/cli-token", { method: "POST" });
+  }
+
+  /**
+   * Ask the server to extend this session if it has entered its renewal
+   * window. The server owns that decision — no client reads `exp` or
+   * compares it against a local clock, which is what keeps clock skew out of
+   * the picture entirely.
+   *
+   * Cookie-mode callers never need this: middleware.Auth re-issues their
+   * cookie inline on any authenticated safe request.
+   */
+  async refreshSession(): Promise<RefreshSessionResponse> {
+    const raw = await this.fetch<unknown>("/api/auth/refresh", {
+      method: "POST",
+    });
+    return parseWithFallback<RefreshSessionResponse>(
+      raw,
+      RefreshSessionResponseSchema,
+      EMPTY_REFRESH_SESSION_RESPONSE,
+      { endpoint: "POST /api/auth/refresh" },
+    );
   }
 
   async getMe(): Promise<User> {
