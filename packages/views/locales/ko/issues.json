@@ -534,6 +534,7 @@
     "trigger_skipped_label": "건너뜀",
     "trigger_wont_trigger": "이번에는 시작하지 않습니다",
     "trigger_none_will_trigger": "어떤 에이전트도 시작하지 않습니다",
+    "all_members_notice": "다른 멤버에게 알림 · @all은 에이전트를 시작하지 않습니다",
     "trigger_reason_mention_squad_leader": "멘션된 Squad의 리더입니다.",
     "trigger_reason_unknown": "이 댓글로 시작합니다.",
     "trigger_will_start": "전송 후 작업을 시작합니다",

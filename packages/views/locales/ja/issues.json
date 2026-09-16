@@ -534,6 +534,7 @@
     "trigger_skipped_label": "スキップ",
     "trigger_wont_trigger": "今回は開始しません",
     "trigger_none_will_trigger": "いずれも開始しません",
+    "all_members_notice": "他のメンバーに通知 · @all はエージェントを起動しません",
     "trigger_reason_mention_squad_leader": "メンションされた Squad のリーダー。",
     "trigger_reason_unknown": "このコメントで開始します。",
     "trigger_will_start": "送信後に作業を開始します",

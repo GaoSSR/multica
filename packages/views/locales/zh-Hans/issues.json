@@ -534,6 +534,7 @@
     "trigger_skipped_label": "已跳过",
     "trigger_wont_trigger": "本次不会开始",
     "trigger_none_will_trigger": "都不会开始",
+    "all_members_notice": "通知其他成员 · @all 不会启动智能体",
     "trigger_reason_mention_squad_leader": "被 @ 小队的队长。",
     "trigger_reason_unknown": "将由这条评论开始。",
     "trigger_will_start": "发送后开始",

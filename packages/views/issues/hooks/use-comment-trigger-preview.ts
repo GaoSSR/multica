@@ -15,6 +15,10 @@ export interface UseCommentTriggerPreviewResult {
   // Explicit @agent / @squad mentions that will NOT trigger if posted as-is
   // (MUL-4525 §2), so the composer can warn before sending.
   blocked: CommentTriggerOutcome[];
+  // A structured @all mention notifies human workspace members, but never
+  // starts agents by itself. Surface that distinction before the comment is
+  // sent so an empty agent preview cannot be mistaken for a broken dispatch.
+  notifiesAllMembers: boolean;
 }
 
 export function isNoteCommentDraft(content: string): boolean {
@@ -83,6 +87,10 @@ export function useCommentTriggerPreview({
   content: string;
 }): UseCommentTriggerPreviewResult {
   const signature = useMemo(() => commentTriggerPreviewSignature(content), [content]);
+  const notifiesAllMembers = useMemo(
+    () => parseMentions(content).some(({ type, id }) => type === "all" && id === "all"),
+    [content],
+  );
   const debouncedSignature = useDebouncedSignature(signature);
   const contentRef = useRef(content);
   const parentKey = parentId ?? "";
@@ -114,11 +122,12 @@ export function useCommentTriggerPreview({
   // Loading and errors intentionally surface as "no agents": the preview is
   // an enhancement, and the composer renders nothing for an empty list.
   if (signature === "empty" || debouncedSignature === "empty") {
-    return { agents: [], blocked: [] };
+    return { agents: [], blocked: [], notifiesAllMembers };
   }
 
   return {
     agents: previewQuery.data?.agents ?? [],
     blocked: previewQuery.data?.blocked ?? [],
+    notifiesAllMembers,
   };
 }

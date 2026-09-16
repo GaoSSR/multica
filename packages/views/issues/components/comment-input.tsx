@@ -286,6 +286,7 @@ function CommentInput({ issueId, onSubmit, onAccepted, onEditAnnotation }: Comme
         <CommentTriggerChips
           agents={triggerPreview.agents}
           blocked={triggerPreview.blocked}
+          notifiesAllMembers={triggerPreview.notifiesAllMembers}
           draftContent={composedContent}
           suppressedAgentIds={suppressedAgentIds}
           onToggle={toggleSuppressedAgent}

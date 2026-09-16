@@ -38,6 +38,37 @@ describe("CommentTriggerChips", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it("explains that @all notifies members without starting agents", () => {
+    renderWithI18n(
+      <CommentTriggerChips
+        agents={[]}
+        notifiesAllMembers
+        suppressedAgentIds={new Set()}
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("Notifies other members · @all does not start agents"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps explicit agent triggers visible alongside an @all notice", () => {
+    renderWithI18n(
+      <CommentTriggerChips
+        agents={[bob]}
+        notifiesAllMembers
+        suppressedAgentIds={new Set()}
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("Notifies other members · @all does not start agents"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button")).toHaveTextContent("Will start when sent");
+  });
+
   it("renders a single agent as a full sentence and toggles on click", () => {
     const onToggle = vi.fn();
     renderWithI18n(

@@ -251,8 +251,63 @@ describe("useCommentTriggerPreview", () => {
 
     await advancePreviewDebounce();
 
-    expect(result.current).toEqual({ agents: [], blocked: [] });
+    expect(result.current).toEqual({
+      agents: [],
+      blocked: [],
+      notifiesAllMembers: false,
+    });
     expect(previewCommentTriggers).not.toHaveBeenCalled();
+  });
+
+  it("still marks @all in a note as a member notification", async () => {
+    const { result } = renderHook(
+      () => useCommentTriggerPreview({
+        issueId: "issue-1",
+        content: "/note [@All members](mention://all/all) heads up",
+      }),
+      { wrapper: createWrapper() },
+    );
+
+    await advancePreviewDebounce();
+
+    expect(result.current).toEqual({
+      agents: [],
+      blocked: [],
+      notifiesAllMembers: true,
+    });
+    expect(previewCommentTriggers).not.toHaveBeenCalled();
+  });
+
+  it("marks structured @all mentions as member notifications", async () => {
+    const { result } = renderHook(
+      () => useCommentTriggerPreview({
+        issueId: "issue-1",
+        content: "[@All members](mention://all/all) heads up",
+      }),
+      { wrapper: createWrapper() },
+    );
+
+    expect(result.current.notifiesAllMembers).toBe(true);
+
+    await advancePreviewDebounce();
+    expect(previewCommentTriggers).toHaveBeenCalledWith(
+      "issue-1",
+      "[@All members](mention://all/all) heads up",
+      undefined,
+      undefined,
+    );
+  });
+
+  it("does not treat plain @all text as a member notification", () => {
+    const { result } = renderHook(
+      () => useCommentTriggerPreview({
+        issueId: "issue-1",
+        content: "plain @all text",
+      }),
+      { wrapper: createWrapper() },
+    );
+
+    expect(result.current.notifiesAllMembers).toBe(false);
   });
 });
 
