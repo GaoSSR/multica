@@ -39,7 +39,7 @@ interface CommentTriggerChipsProps {
   // target won't run and why, not a silent no-op after sending.
   blocked?: CommentTriggerOutcome[];
   /** Whether the draft contains the structured @all member broadcast. */
-  notifiesAllMembers?: boolean;
+  hasAllMembersMention?: boolean;
   // The draft markdown, used only to label each blocked target with the name the
   // user typed in its mention markup. The server omits blocked target names
   // (enumeration-safety); this is the user's own text, so it discloses nothing new.
@@ -128,7 +128,7 @@ function TriggerAgentTooltipBody({
 export function CommentTriggerChips({
   agents,
   blocked = [],
-  notifiesAllMembers = false,
+  hasAllMembersMention = false,
   draftContent = "",
   suppressedAgentIds,
   onToggle,
@@ -140,7 +140,7 @@ export function CommentTriggerChips({
 
   // Loading and errors render nothing: the preview is an enhancement, and
   // any interim chrome here reads as composer noise.
-  if (agents.length === 0 && blocked.length === 0 && !notifiesAllMembers) return null;
+  if (agents.length === 0 && blocked.length === 0 && !hasAllMembersMention) return null;
 
   const allowed =
     agents.length === 1 ? (
@@ -159,11 +159,11 @@ export function CommentTriggerChips({
       />
     ) : null;
 
-  if (blocked.length === 0 && !notifiesAllMembers) return allowed;
+  if (blocked.length === 0 && !hasAllMembersMention) return allowed;
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      {notifiesAllMembers && (
+      {hasAllMembersMention && (
         <span className="inline-flex h-6 min-w-0 max-w-full animate-in fade-in items-center gap-1.5 rounded-md px-1.5 text-micro font-medium text-muted-foreground">
           <Users className="size-3 shrink-0" />
           <span className="truncate">{t(($) => $.comment.all_members_notice)}</span>

@@ -545,7 +545,7 @@
     "trigger_skipped_label": "Skipped",
     "trigger_wont_trigger": "Won't start this time",
     "trigger_none_will_trigger": "No agents will start",
-    "all_members_notice": "Notifies other members · @all does not start agents",
+    "all_members_notice": "Member broadcast · @all does not start agents",
     "trigger_reason_mention_squad_leader": "Leads a squad mentioned here.",
     "trigger_reason_unknown": "Will start from this comment.",
     "trigger_will_start": "Will start when sent",

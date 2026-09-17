@@ -38,33 +38,34 @@ describe("CommentTriggerChips", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("explains that @all notifies members without starting agents", () => {
+  it("describes @all semantics without promising any recipients", () => {
     renderWithI18n(
       <CommentTriggerChips
         agents={[]}
-        notifiesAllMembers
+        hasAllMembersMention
         suppressedAgentIds={new Set()}
         onToggle={vi.fn()}
       />,
     );
 
     expect(
-      screen.getByText("Notifies other members · @all does not start agents"),
+      screen.getByText("Member broadcast · @all does not start agents"),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/notif/i)).not.toBeInTheDocument();
   });
 
-  it("keeps explicit agent triggers visible alongside an @all notice", () => {
+  it("keeps explicit agent triggers visible alongside @all semantics", () => {
     renderWithI18n(
       <CommentTriggerChips
         agents={[bob]}
-        notifiesAllMembers
+        hasAllMembersMention
         suppressedAgentIds={new Set()}
         onToggle={vi.fn()}
       />,
     );
 
     expect(
-      screen.getByText("Notifies other members · @all does not start agents"),
+      screen.getByText("Member broadcast · @all does not start agents"),
     ).toBeInTheDocument();
     expect(screen.getByRole("button")).toHaveTextContent("Will start when sent");
   });

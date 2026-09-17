@@ -545,7 +545,7 @@
     "trigger_skipped_label": "Ignoré",
     "trigger_wont_trigger": "Ne démarrera pas cette fois",
     "trigger_none_will_trigger": "Aucun agent ne démarrera",
-    "all_members_notice": "Notifie les autres membres · @all ne démarre aucun agent",
+    "all_members_notice": "Diffusion aux membres · @all ne démarre aucun agent",
     "trigger_reason_mention_squad_leader": "Dirige un squad mentionné ici.",
     "trigger_reason_unknown": "Démarrera à partir de ce commentaire.",
     "trigger_will_start": "Démarrera à l'envoi",
