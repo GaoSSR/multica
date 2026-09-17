@@ -409,9 +409,14 @@ export const MentionList = forwardRef<MentionListRef, MentionListProps>(
         // see pickerNavigationDirection.
         const direction = pickerNavigationDirection(event);
         if (direction !== null) {
+          // With no rows, including while remote search is pending, the picker
+          // has nothing to navigate. Let the host editor own the key instead.
+          if (orderedItems.length === 0) return false;
           const selectableIndexes = orderedItems.flatMap((item, index) =>
             item.disabledReason ? [] : [index],
           );
+          // Rows exist but all are disabled: keep the picker inert rather than
+          // moving the caret behind the visible popup.
           if (selectableIndexes.length === 0) return true;
           const current = selectableIndexes.indexOf(selectedIndex);
           const delta =
@@ -427,6 +432,11 @@ export const MentionList = forwardRef<MentionListRef, MentionListProps>(
         // Enter is the canonical accept; plain Tab is an additive alias (see
         // isPickerAcceptKey). Shift/modifier+Tab fall through to focus nav.
         if (isPickerAcceptKey(event)) {
+          // An empty picker cannot accept anything, so preserve the editor's
+          // newline, submit shortcut, and focus-navigation behavior.
+          if (orderedItems.length === 0) return false;
+          // A non-empty list can still have no selectable row when every item
+          // is disabled. Keep those visible rows inert instead of falling through.
           if (selectedIndex < 0) return true;
           selectItem(orderedItems[selectedIndex]);
           return true;
